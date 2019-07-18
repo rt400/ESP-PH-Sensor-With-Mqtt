@@ -1,0 +1,138 @@
+#include <PubSubClient.h>
+#include <ESP8266WiFi.h>
+#include <ESP8266mDNS.h>
+#include <ESP8266WebServer.h>
+#include <SimpleTimer.h>
+
+
+//USER CONFIGURED SECTION START//
+const char* ssid = "YOUR_SSID";
+const char* password = "YOUR_PASS";
+const char* host = "ph_sendor-web";
+const char* mqtt_server = "YOUR_MQTT_SERVER";
+const int mqtt_port = 1883;
+const char *mqtt_user = "MQTT_USER";
+const char *mqtt_pass = "MQTT_PASS";
+const char *mqtt_client_name = "PH_Sensor"; // Client connections can't have the same connection name
+//USER CONFIGURED SECTION END//
+
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+SimpleTimer timer;
+
+// Variables
+float calibration = 0.00; //change this value to calibrate
+const int analogInPin = A0; 
+int sensorValue = 0; 
+unsigned long int avgValue; 
+float b;
+int buf[10],temp;
+uint8_t tempBuf[10];
+char datasend[50];
+
+ESP8266WebServer server(80);
+const char* serverIndex = "<form method='POST' action='/update' enctype='multipart/form-data'><input type='file' name='update'><input type='submit' value='Update'></form>";
+
+//Functions
+
+void setup_wifi()
+{
+  WiFi.begin(ssid, password);
+  if (WiFi.waitForConnectResult() == WL_CONNECTED) {
+    MDNS.begin(host);
+    server.on("/", HTTP_GET, []() {
+      server.sendHeader("Connection", "close");
+      server.send(200, "text/html", serverIndex);
+    });
+    server.on("/update", HTTP_POST, []() {
+      server.sendHeader("Connection", "close");
+      server.send(200, "text/plain", (Update.hasError()) ? "FAIL" : "OK");
+      ESP.restart();
+    }, []() {
+      HTTPUpload& upload = server.upload();
+      if (upload.status == UPLOAD_FILE_START) {
+        Serial.setDebugOutput(true);
+        WiFiUDP::stopAll();
+        Serial.printf("Update: %s\n", upload.filename.c_str());
+        uint32_t maxSketchSpace = (ESP.getFreeSketchSpace() - 0x1000) & 0xFFFFF000;
+        if (!Update.begin(maxSketchSpace)) { //start with max available size
+          Update.printError(Serial);
+        }
+      } else if (upload.status == UPLOAD_FILE_WRITE) {
+        if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+          Update.printError(Serial);
+        }
+      } else if (upload.status == UPLOAD_FILE_END) {
+        if (Update.end(true)) { //true to set the size to the current progress
+          Serial.printf("Update Success: %u\nRebooting...\n", upload.totalSize);
+        } else {
+          Update.printError(Serial);
+        }
+        Serial.setDebugOutput(false);
+      }
+      yield();
+    });
+    server.begin();
+    MDNS.addService("http", "tcp", 80);
+
+    Serial.printf("Ready! Open http://%s.local in your browser\n", host);
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("WiFi Failed");
+  }
+}
+
+void sendInfoSensor()
+{
+  for (int i = 0; i < 10; i++)
+  {
+    buf[i] = analogRead(analogInPin);
+    delay(30);
+  }
+  for (int i = 0; i < 9; i++)
+  {
+    for (int j = i + 1; j < 10; j++)
+    {
+      if (buf[i] > buf[j])
+      {
+        temp = buf[i];
+        buf[i] = buf[j];
+        buf[j] = temp;
+      }
+    }
+  }
+  avgValue = 0;
+  for (int i = 2; i < 8; i++)
+    avgValue += buf[i];
+  float pHVol = (float)avgValue * 5.0 / 1024 / 6;
+  float phValue = -5.70 * pHVol + calibration;
+  Serial.print("sensor = ");
+  Serial.println(phValue);
+  String temp_str = String(phValue);
+  temp_str.toCharArray(datasend, temp_str.length() + 1); //packaging up the data to publish to mqtt
+  client.publish("ph_sensor/data", datasend);
+}
+
+void setup()
+{
+  Serial.begin(115200);
+  WiFi.mode(WIFI_STA);
+  setup_wifi();
+  client.setServer(mqtt_server, mqtt_port);
+  timer.setInterval(5000, sendInfoSensor);
+
+}
+
+void loop()
+{
+  while (!client.connected()) {
+    Serial.print("Attempting MQTT connection...");
+    // Attempt to connect
+    if (client.connect(mqtt_client_name, mqtt_user, mqtt_pass)) { // need to change if you need auth
+      Serial.println("connected");
+      client.loop();
+    } else {
+      delay(2000);
+    }
+}
